@@ -1,0 +1,21 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Arduino IDE
+build/
+*.elf
+*.bin
+*.hex
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Host test binaries
+test/host/build/
+
+# Editors / OS
+.vscode/
+.DS_Store

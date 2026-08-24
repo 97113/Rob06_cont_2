@@ -37,15 +37,21 @@ STREAM_HZ = 100
 HISTORY_S = 20.0
 OUT_DIR = Path(__file__).resolve().parent / "logs"
 
-# T,<t_ms>,<state>,<events>,<enabled>,<p_cmd>,<p_act>,<v_cmd>,<v_act>,
-#   <t_cmd>,<t_act>,<iq>,<vbus>,<temp>,<reach_ms>,<peak_vel>,<tx>,<rx>,<miss>
-T_FIELDS = ["t_ms", "state", "events", "enabled", "p_cmd", "p_act", "v_cmd",
-            "v_act", "t_cmd", "t_act", "iq", "vbus", "temp", "reach_ms",
-            "peak_vel", "tx", "rx", "miss"]
+# T,<t_ms>,<state>,<events>,<active>,<fault>,<enabled>,<p_cmd>,<p_act>,
+#   <v_cmd>,<v_act>,<t_cmd>,<t_act>,<iq>,<vbus>,<temp>,<reach_ms>,<peak_vel>,
+#   <tx>,<rx>,<miss>
+#
+# events is latched until the fault is cleared; active is rebuilt by the
+# firmware every control tick and says what is limiting the axis right now.
+# Keeping them apart is what stops a one-millisecond regen cap from sitting on
+# the status line for the rest of the session.
+T_FIELDS = ["t_ms", "state", "events", "active", "fault", "enabled",
+            "p_cmd", "p_act", "v_cmd", "v_act", "t_cmd", "t_act", "iq",
+            "vbus", "temp", "reach_ms", "peak_vel", "tx", "rx", "miss"]
 
 # Columns of the 1 kHz dump, in firmware order (logger::csvHeader()).
 D_FIELDS = ["t_us", "p_cmd", "p_act", "v_cmd", "v_act", "t_cmd", "t_act",
-            "iq", "vbus", "temp", "state", "events"]
+            "iq", "vbus", "temp", "state", "events", "active"]
 
 # axes index, data key, label, unit, decimals
 SERIES = [
@@ -60,6 +66,7 @@ SERIES = [
 ]
 AXIS_LABEL = ["angle [deg]", "speed [rad/s]", "torque [Nm]", "current / bus"]
 
+# Mirrors EventBits in src/types.h.
 EVENT_NAMES = [
     (1 << 0,  "CAN-MISS"),    (1 << 1,  "BUS-OFF"),
     (1 << 2,  "DERATE"),      (1 << 3,  "OVERTEMP"),
@@ -67,14 +74,35 @@ EVENT_NAMES = [
     (1 << 6,  "OVERCURRENT"), (1 << 7,  "ENCODER"),
     (1 << 8,  "STALL"),       (1 << 9,  "CMD-STALE"),
     (1 << 10, "POS-LIMIT"),   (1 << 11, "REGEN-LIM"),
-    (1 << 12, "UNCAL"),
+    (1 << 12, "UNCAL"),       (1 << 13, "DRIVER-IC"),
+    (1 << 14, "POS-INIT"),    (1 << 15, "HW-ID"),
+    (1 << 16, "AUX-QUIET"),
+]
+
+# Mirrors FaultBits in src/rs06_proto.h - the raw Type21 word, reported so a
+# cause with no event bit of its own is still identifiable from here.
+FAULT_NAMES = [
+    (1 << 0,  "overtemp"),      (1 << 1,  "driver-chip"),
+    (1 << 2,  "undervoltage"),  (1 << 3,  "overvoltage"),
+    (1 << 4,  "Ib-overcur"),    (1 << 5,  "Ic-overcur"),
+    (1 << 7,  "enc-uncal"),     (1 << 8,  "hw-id"),
+    (1 << 9,  "pos-init"),      (1 << 14, "stall-algo"),
+    (1 << 16, "Ia-overcur"),
 ]
 
 
-def decode_events(mask):
+def _decode(mask, table):
     if not mask:
         return "-"
-    return " ".join(n for b, n in EVENT_NAMES if mask & b) or hex(mask)
+    return " ".join(n for b, n in table if mask & b) or hex(mask)
+
+
+def decode_events(mask):
+    return _decode(mask, EVENT_NAMES)
+
+
+def decode_faults(mask):
+    return _decode(mask, FAULT_NAMES)
 
 
 def stamp():
@@ -863,10 +891,22 @@ class App(tk.Tk):
             for dq in h.values():
                 dq.popleft()
 
+        latched = int(d["events"])
+        active = int(d["active"])
+        fault = int(d.get("fault", 0))
+        # A latched fault is the headline; with none outstanding, show the live
+        # limit instead, marked with "~" so the two never look alike.
+        if latched:
+            tail = f"[{decode_events(latched)}]"
+            if fault:
+                tail += f" fault:{decode_faults(fault)}"
+        elif active:
+            tail = f"~{decode_events(active)}"
+        else:
+            tail = "[-]"
         self.status.config(
             text=(f"{d['state']:<9} {float(d['vbus']):5.1f}V {float(d['temp']):5.1f}C  "
-                  f"ang {float(d['p_act']):8.2f}d  tq {float(d['t_act']):6.2f}Nm  "
-                  f"[{decode_events(int(d['events']))}]"))
+                  f"ang {float(d['p_act']):8.2f}d  tq {float(d['t_act']):6.2f}Nm  {tail}"))
 
     def _redraw_live(self):
         if not self.hist["t"]:
@@ -907,9 +947,13 @@ class App(tk.Tk):
         if not rows:
             return self.log("! capture returned no rows")
         cols = {k: [] for k in D_FIELDS}
+        # Accept a row that is one column short: captures taken before the
+        # events word was split carry no `active` column, and refusing to plot
+        # them would throw away the existing test history.
+        widths = (len(D_FIELDS), len(D_FIELDS) - 1)
         for line in rows:
             f = line.split(",")
-            if len(f) != len(D_FIELDS):
+            if len(f) not in widths:
                 continue
             try:
                 vals = [float(x) for x in f]

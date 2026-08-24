@@ -23,7 +23,10 @@
 // Core2 -> PC
 //   #RS06 ...            banner / comments
 //   OK <text> | ERR <text>
-//   T,<fields...>        streamed telemetry (header announced by STREAM)
+//   T,<fields...>        streamed telemetry (header announced by STREAM).
+//                        Two event words: `events` is latched until the fault
+//                        is cleared, `active` is rebuilt every control tick
+//                        and says what is limiting the axis right now.
 //   D,<n> then CSV rows then DEND
 // ---------------------------------------------------------------------------
 #pragma once

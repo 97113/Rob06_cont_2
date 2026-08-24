@@ -57,7 +57,11 @@ constexpr int TREND_N = 120;
 float     g_trend[TREND_N] = {0};
 int       g_trend_i = 0;
 
-char      g_last[24][24] = {{0}};  // per-field cache to suppress redraw flicker
+// Per-field cache to suppress redraw flicker. The strings must fit whole: a
+// key that gets truncated never compares equal to the next one, so the field
+// redraws at the full 20 Hz and flickers - which is what the 24 byte version
+// did to the CAN diagnostics row and now to the status bar.
+char      g_last[24][80] = {{0}};
 char      g_toast[40] = {0};
 uint32_t  g_toast_t = 0;
 
@@ -83,7 +87,7 @@ void req(uint8_t t, float f = 0.0f, uint8_t u = 0) {
 float* pval(int i) { return pfield(g_par, i); }
 
 bool cached(int slot, const char* s) {
-  if (slot < 0 || slot >= 24) return false;
+  if (slot < 0 || slot >= (int)(sizeof(g_last) / sizeof(g_last[0]))) return false;
   if (strcmp(g_last[slot], s) == 0) return true;
   snprintf(g_last[slot], sizeof(g_last[slot]), "%s", s);
   return false;
@@ -101,22 +105,35 @@ void drawButton(const Rect& r, const char* label, uint16_t bg, uint16_t fg) {
 }
 
 // Most significant reason first - the status bar has room for one.
-const char* eventName(uint16_t ev) {
+const char* eventName(uint32_t ev) {
   if (!ev) return "OK";
   if (ev & EV_OVERCURRENT)  return "OVERCURRENT";
+  if (ev & EV_DRIVER_CHIP)  return "DRIVER-IC";
   if (ev & EV_TEMP_TRIP)    return "OVERTEMP";
   if (ev & EV_ENCODER)      return "ENCODER";
   if (ev & EV_STALL)        return "STALL";
+  if (ev & EV_POS_INIT)     return "POS-INIT";
+  if (ev & EV_HW_ID)        return "HW-ID";
   if (ev & EV_OVERVOLT)     return "OVERVOLT";
   if (ev & EV_UNDERVOLT)    return "UNDERVOLT";
   if (ev & EV_CAN_BUS_OFF)  return "BUS-OFF";
   if (ev & EV_CAN_MISS)     return "CAN-MISS";
   if (ev & EV_CMDSRC_STALE) return "CMD-STALE";
   if (ev & EV_POS_LIMIT)    return "POS-LIMIT";
+  if (ev & EV_AUX_STALE)    return "AUX-QUIET";
   if (ev & EV_TEMP_DERATE)  return "DERATE";
   if (ev & EV_REGEN_LIMIT)  return "REGEN-LIM";
   if (ev & EV_UNCALIBRATED) return "UNCAL";
   return "?";
+}
+
+// What the status bar should say on the right. A latched fault always wins;
+// with none outstanding it shows what is limiting the axis at this instant,
+// prefixed with "~" so a live cap can never be mistaken for an incident.
+const char* statusWord(char* buf, size_t n) {
+  if (g_tm.events) return eventName(g_tm.events);
+  if (g_tm.active) { snprintf(buf, n, "~%s", eventName(g_tm.active)); return buf; }
+  return "OK";
 }
 
 // ---------------------------------------------------------------------------
@@ -125,10 +142,13 @@ void drawStatusBar() {
   const bool sft = (g_tm.state == ST_FAULT_SOFT);
   uint16_t bg = flt ? TFT_RED : (sft ? TFT_ORANGE : (g_tm.enabled ? TFT_DARKGREEN : TFT_NAVY));
 
+  char w[24];
+  const char* word = statusWord(w, sizeof(w));
+
   char s[64];
-  snprintf(s, sizeof(s), "%s|%.0fC|%04X|%c|%.1fV",
-           ctrl::stateName(g_tm.state), g_tm.temp, g_tm.events,
-           (g_tm.miss * 100 < g_tm.tx + 1) ? 'K' : '!', g_tm.vbus);
+  snprintf(s, sizeof(s), "%s|%.1f|%s|%c|%.1f",
+           ctrl::stateName(g_tm.state), g_tm.temp, word,
+           (g_tm.miss * 50 < g_tm.mtx + 1) ? 'K' : '!', g_tm.vbus);
   if (cached(0, s) && !g_redraw) return;
 
   M5.Display.fillRect(0, 0, 320, SB_H, bg);
@@ -138,12 +158,13 @@ void drawStatusBar() {
   M5.Display.drawString(ctrl::stateName(g_tm.state), 4, SB_H / 2);
 
   char b[40];
-  snprintf(b, sizeof(b), "%.1fC  %.1fV", g_tm.temp, g_tm.vbus);
+  snprintf(b, sizeof(b), "%.1fC  %.1fV%s", g_tm.temp, g_tm.vbus,
+           g_tm.aux_ok ? "" : "?");   // "?" = reading is stale, not measured now
   M5.Display.setTextDatum(middle_center);
   M5.Display.drawString(b, 160, SB_H / 2);
 
   snprintf(b, sizeof(b), "%s %s",
-           (g_tm.miss * 50 < g_tm.tx + 1) ? "CAN:OK" : "CAN:!!", eventName(g_tm.events));
+           (g_tm.miss * 50 < g_tm.mtx + 1) ? "CAN:OK" : "CAN:!!", word);
   M5.Display.setTextDatum(middle_right);
   M5.Display.drawString(b, 316, SB_H / 2);
 }
@@ -163,7 +184,7 @@ void drawBottomBar() {
 
 // ---------------------------------------------------------------------------
 void row(int slot, int y, const char* label, const char* value, uint16_t col) {
-  char key[24];
+  char key[80];
   snprintf(key, sizeof(key), "%s", value);
   if (cached(slot, key) && !g_redraw) return;
   M5.Display.fillRect(0, y, 320, 30, TFT_BLACK);
@@ -199,7 +220,7 @@ void drawMonitor() {
   {
     static const char* ST[5] = { "STOP", "RUN", "OFF", "REC", "?" };
     const uint8_t si = (g_tm.twai_state < 4) ? g_tm.twai_state : 4;
-    char d[40];
+    char d[80];
     snprintf(d, sizeof(d), "st:%s TX%lu RX%lu MS%lu TEC%u BE%lu Q%lu",
              ST[si], (unsigned long)g_tm.tx, (unsigned long)g_tm.rx,
              (unsigned long)g_tm.miss, (unsigned)g_tm.twai_tec,

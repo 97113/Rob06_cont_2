@@ -42,17 +42,35 @@ QueueHandle_t  g_q   = nullptr;
 CtrlState g_state      = ST_INIT;
 CtrlMode  g_mode       = CM_POSITION;
 bool      g_enabled    = false;
-uint16_t  g_events     = 0;
+// Latched: something went wrong, held until CLEAR FAULT / START.
+uint32_t  g_events     = 0;
+// Instantaneous: rebuilt from nothing every tick. See EventBits in types.h.
+uint32_t  g_active     = 0;
 uint32_t  g_miss_run   = 0;         // consecutive missed replies
 uint32_t  g_aux        = 0;
 uint32_t  g_soft_t0    = 0;
 float     g_soft_t_ref = 0.0f;
-float     g_vbus_boot  = 0.0f;
-float     g_vbus_trip  = DEF_VBUS_TRIP_MAX;
 float     g_iq         = 0.0f;
 float     g_vbus       = 0.0f;
+bool      g_vbus_ok    = false;     // reading fresh enough to act on
+uint32_t  g_vbus_age   = 0;
 uint32_t  g_fault_word = 0;
 uint32_t  g_warn_word  = 0;
+
+// --- VBUS rest-voltage reference ------------------------------------------
+// The overvoltage trip is relative to the supply actually fitted, so it needs
+// a trustworthy rest voltage. The first good sample seeds it immediately (no
+// window without protection), then the median of VBUS_REF_SAMPLES readings
+// taken while the motor is disabled replaces that provisional value.
+float     g_vbus_boot  = 0.0f;
+float     g_vbus_trip  = DEF_VBUS_TRIP_MAX;
+float     g_vbus_ref_buf[VBUS_REF_SAMPLES] = {0};
+int       g_vbus_ref_n    = 0;
+bool      g_vbus_ref_done = false;
+// Age of the cached VBUS reading last tick. The cache is read every tick but
+// only refilled when a reply lands, so "the age went down" is how a genuinely
+// new measurement is told apart from the same one read again.
+uint32_t  g_vbus_prev_age = 0xFFFFFFFFu;
 
 // position unwrapping
 float     g_prev_raw   = 0.0f;
@@ -63,6 +81,38 @@ float     g_pos_unwrap = 0.0f;      // unwrapped, motor frame
 
 float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 float sgnf(float v)                       { return v >= 0.0f ? 1.0f : -1.0f; }
+
+// ---------------------------------------------------------------------------
+// Drop everything known about the supply voltage. Called when the CAN wiring
+// changes underneath us: a reference measured through the previous pin pair
+// (or from a motor that is no longer answering) must not keep arming the
+// overvoltage trip.
+// ---------------------------------------------------------------------------
+void resetVbusRef() {
+  g_vbus_boot    = 0.0f;
+  g_vbus_trip    = DEF_VBUS_TRIP_MAX;
+  g_vbus_ref_n   = 0;
+  g_vbus_ref_done= false;
+  g_vbus_prev_age= 0xFFFFFFFFu;
+  g_vbus         = 0.0f;
+  g_vbus_ok      = false;
+  g_vbus_age     = 0;
+  g_iq           = 0.0f;
+}
+
+// Median of the collected rest samples. Nine elements, called once - an
+// insertion sort on a copy is the right amount of machinery here.
+float vbusRefMedian() {
+  float s[VBUS_REF_SAMPLES];
+  for (int i = 0; i < g_vbus_ref_n; i++) s[i] = g_vbus_ref_buf[i];
+  for (int i = 1; i < g_vbus_ref_n; i++) {
+    const float key = s[i];
+    int j = i - 1;
+    while (j >= 0 && s[j] > key) { s[j + 1] = s[j]; j--; }
+    s[j + 1] = key;
+  }
+  return s[g_vbus_ref_n / 2];
+}
 
 // ---------------------------------------------------------------------------
 // Push the settings that live inside the motor. Only called while disabled -
@@ -78,7 +128,7 @@ void pushMotorConfig(const Params& P) {
 }
 
 // ---------------------------------------------------------------------------
-void goSoftFault(uint16_t ev, float last_torque) {
+void goSoftFault(uint32_t ev, float last_torque) {
   if (g_state == ST_FAULT_HARD) return;
   g_events |= ev;
   if (g_state == ST_FAULT_SOFT) return;
@@ -88,7 +138,7 @@ void goSoftFault(uint16_t ev, float last_torque) {
   g_cal.abort();
 }
 
-void goHardFault(uint16_t ev) {
+void goHardFault(uint32_t ev) {
   g_events |= ev;
   if (g_state == ST_FAULT_HARD) return;
   g_state = ST_FAULT_HARD;
@@ -215,6 +265,11 @@ bool handleRequest(const CtrlRequest& r, Params& P) {
       return true;
     }
     g_can.resetStats();
+    g_can.resetCache();
+    // The supply reference was measured through the old wiring; keeping it
+    // would arm the overvoltage trip against a number that no longer means
+    // anything. Re-measure from scratch.
+    resetVbusRef();
     g_miss_run   = 0;
     g_fault_word = 0;
     g_warn_word  = 0;
@@ -251,11 +306,12 @@ bool handleRequest(const CtrlRequest& r, Params& P) {
 // The limiter chain. Runs on every command, in every state.
 // ---------------------------------------------------------------------------
 void applyLimits(const Params& P, MotionCmd& c, bool holding) {
-  // 1. thermal derate
+  // 1. thermal derate. Derating is a live condition, not an incident: it goes
+  // in the instantaneous word so it clears itself once the motor cools.
   float tscale = 1.0f;
   if (g_tm.temp > P.temp_derate) {
     tscale = clampf((P.temp_trip - g_tm.temp) / (P.temp_trip - P.temp_derate), 0.0f, 1.0f);
-    g_events |= EV_TEMP_DERATE;
+    g_active |= EV_TEMP_DERATE;
   }
   float tcap = P.lim_torque * tscale;
 
@@ -271,7 +327,7 @@ void applyLimits(const Params& P, MotionCmd& c, bool holding) {
   const bool braking = (c.t_ff * g_tm.vel < 0.0f) && (w > 0.5f);
   if (braking) {
     const float tcap_regen = P.regen_w_max / w;
-    if (tcap_regen < tcap) { tcap = tcap_regen; g_events |= EV_REGEN_LIMIT; }
+    if (tcap_regen < tcap) { tcap = tcap_regen; g_active |= EV_REGEN_LIMIT; }
     // Tell the profiler too, so it stops planning a deceleration it is not
     // allowed to execute (otherwise it would overshoot the target).
     g_traj.setDecelCap(tcap_regen / fmaxf(P.j_hat, 1e-4f));
@@ -279,10 +335,13 @@ void applyLimits(const Params& P, MotionCmd& c, bool holding) {
     g_traj.setDecelCap(P.lim_dec);
   }
 
-  // 3. bus overvoltage: stop feeding energy back immediately
-  if (g_vbus > 1.0f && g_vbus > g_vbus_trip && braking) {
+  // 3. bus overvoltage: stop feeding energy back immediately. Only ever acted
+  // on with a fresh reading - cutting braking torque on a value that is one
+  // second old is as likely to be wrong as right.
+  if (g_vbus_ok && g_vbus > g_vbus_trip && braking) {
     c.t_ff = 0.0f;
-    g_events |= EV_OVERVOLT;
+    g_active |= EV_OVERVOLT;
+    g_events |= EV_OVERVOLT;   // worth keeping a record of, unlike the caps
   }
 
   // 4. hard caps
@@ -301,20 +360,32 @@ void evaluateFaults(const Params& P, uint32_t now_ms, float last_torque) {
   if (f2 & FB2_OVERTEMP)    goHardFault(EV_TEMP_TRIP);
   if (f2 & FB2_ENCODER)     goHardFault(EV_ENCODER);
   if (f2 & FB2_STALL)       goHardFault(EV_STALL);
-  if (f2 & FB2_UNCALIBRATED) g_events |= EV_UNCALIBRATED;
+  if (f2 & FB2_UNCALIBRATED) g_active |= EV_UNCALIBRATED;
 
   // --- severe, from the Type21 fault frame (overvoltage lives only here) --
+  // Mapped bit by bit. Collapsing six unrelated causes into EV_OVERCURRENT,
+  // as this used to, made the screen report a phase overcurrent when what had
+  // actually failed was the gate driver or the position initialisation.
   if (g_fault_word & FLT_OVERVOLTAGE)  goHardFault(EV_OVERVOLT);
-  if (g_fault_word & (FLT_IA_OVERCUR | FLT_IB_OVERCUR | FLT_IC_OVERCUR |
-                      FLT_DRIVER_CHIP | FLT_STALL_ALGO | FLT_POS_INIT |
-                      FLT_HW_ID | FLT_OVERTEMP))
-    goHardFault(EV_OVERCURRENT);
   if (g_fault_word & FLT_UNDERVOLTAGE) goHardFault(EV_UNDERVOLT);
+  if (g_fault_word & (FLT_IA_OVERCUR | FLT_IB_OVERCUR | FLT_IC_OVERCUR))
+                                       goHardFault(EV_OVERCURRENT);
+  if (g_fault_word & FLT_OVERTEMP)     goHardFault(EV_TEMP_TRIP);
+  if (g_fault_word & FLT_DRIVER_CHIP)  goHardFault(EV_DRIVER_CHIP);
+  if (g_fault_word & FLT_STALL_ALGO)   goHardFault(EV_STALL);
+  if (g_fault_word & FLT_POS_INIT)     goHardFault(EV_POS_INIT);
+  if (g_fault_word & FLT_HW_ID)        goHardFault(EV_HW_ID);
+  if (g_fault_word & FLT_ENC_UNCAL)    goHardFault(EV_ENCODER);
 
   // --- severe, measured locally ------------------------------------------
+  // The undervoltage floor is the higher of the fixed limit and a fraction of
+  // the measured rest voltage, so the same build guards a 32 V bench supply
+  // and a 13S pack without anyone remembering to change a number.
+  const float vfloor = fmaxf(P.vbus_min,
+                             g_vbus_ref_done ? g_vbus_boot * VBUS_SAG_TRIP_FRAC : 0.0f);
   if (g_tm.temp >= P.temp_trip)                       goHardFault(EV_TEMP_TRIP);
-  if (g_vbus > 1.0f && g_vbus > g_vbus_trip + 2.0f)   goHardFault(EV_OVERVOLT);
-  if (g_vbus > 1.0f && g_vbus < P.vbus_min)           goHardFault(EV_UNDERVOLT);
+  if (g_vbus_ok && g_vbus > g_vbus_trip + 2.0f)       goHardFault(EV_OVERVOLT);
+  if (g_vbus_ok && g_vbus < vfloor)                   goHardFault(EV_UNDERVOLT);
   if (g_miss_run >= DEF_CAN_MISS_HARD)                goHardFault(EV_CAN_MISS);
   if (!g_can.busHealthy())                            goHardFault(EV_CAN_BUS_OFF);
 
@@ -330,29 +401,90 @@ void evaluateFaults(const Params& P, uint32_t now_ms, float last_torque) {
 }
 
 // ---------------------------------------------------------------------------
-void auxPoll(bool braking) {
+// Auxiliary telemetry: VBUS, phase current and the Type21 fault frame.
+//
+// Requests are fire-and-forget - one CAN frame, no wait. Replies are filed by
+// Rs06::pump() whenever they turn up and are read back out of the cache here,
+// with an age attached. That decoupling is the fix for the failure this
+// replaces: the old code waited 300 us inside the slot, and any reply slower
+// than that was swallowed and dropped by the next tick's feedback wait. VBUS
+// updated 0.7 times a second against a design rate of 200 Hz, and the current
+// reading never updated at all - so every protection built on VBUS was
+// effectively running blind.
+// ---------------------------------------------------------------------------
+void auxPoll(const Params& P, bool braking) {
   g_aux++;
+
+  // --- schedule ------------------------------------------------------------
   const uint32_t vdiv = braking ? AUX_VBUS_DIV_DECEL : AUX_VBUS_DIV;
-  float v;
-  if (g_aux % vdiv == 0) {
-    if (g_can.readParamF(P_VBUS, v) && v > 1.0f && v < 100.0f) {
-      g_vbus = v;
+  if      (g_aux % vdiv == 0)           g_can.requestParam(P_VBUS);
+  else if (g_aux % AUX_FAULT_DIV == 3)  g_can.requestFault();
+  else if (g_aux % AUX_IQF_DIV  == 7)   g_can.requestParam(P_IQF);
+
+  // --- harvest -------------------------------------------------------------
+  float v; uint32_t age;
+
+  if (g_can.paramValue(P_VBUS, v, age) && v > 1.0f && v < 100.0f) {
+    g_vbus     = v;
+    g_vbus_age = age;
+    g_vbus_ok  = (age <= AUX_STALE_MS);
+    const bool new_sample = (age < g_vbus_prev_age);
+    g_vbus_prev_age = age;
+
+    if (g_vbus_ok) {
+      // Seed the trip from the first good reading so there is never a window
+      // with no overvoltage protection at all...
       if (g_vbus_boot <= 0.0f) {
         g_vbus_boot = v;
-        g_vbus_trip = fminf(DEF_VBUS_TRIP_MAX, v + g_par.vbus_margin);
+        g_vbus_trip = fminf(DEF_VBUS_TRIP_MAX, v + P.vbus_margin);
+      }
+      // ...then replace that provisional value with a median taken while the
+      // motor is disabled, which is the only time the rail is guaranteed to
+      // be at rest (regen cannot lift a rail the motor is not driving into).
+      if (new_sample && !g_vbus_ref_done && !g_enabled) {
+        g_vbus_ref_buf[g_vbus_ref_n++] = v;
+        if (g_vbus_ref_n >= VBUS_REF_SAMPLES) {
+          g_vbus_boot     = vbusRefMedian();
+          g_vbus_trip     = fminf(DEF_VBUS_TRIP_MAX, g_vbus_boot + P.vbus_margin);
+          g_vbus_ref_done = true;
+        }
       }
     }
-  } else if (g_aux % AUX_FAULT_DIV == 3) {
-    uint32_t f, w;
-    if (g_can.readFault(f, w)) { g_fault_word = f; g_warn_word = w; }
-  } else if (g_aux % AUX_IQF_DIV == 7) {
-    if (g_can.readParamF(P_IQF, v) && fabsf(v) < 100.0f) g_iq = v;
+  } else {
+    g_vbus_ok       = false;
+    g_vbus_age      = AUX_STALE_MS + 1;
+    g_vbus_prev_age = 0xFFFFFFFFu;
   }
+
+  if (g_can.paramValue(P_IQF, v, age) && fabsf(v) < 100.0f && age <= AUX_STALE_MS) {
+    g_iq = v;
+  }
+
+  uint32_t f, w;
+  if (g_can.faultWords(f, w, age) && age <= AUX_STALE_MS) {
+    g_fault_word = f;
+    g_warn_word  = w;
+  }
+
+  // A silent auxiliary channel is itself worth showing: it means every VBUS
+  // guard below is inactive, which is exactly the condition that went
+  // unnoticed for the whole of the captured test history.
+  if (!g_vbus_ok && g_enabled) g_active |= EV_AUX_STALE;
 }
 
 // ---------------------------------------------------------------------------
 void tick() {
   const uint32_t now_ms = millis();
+
+  // Collect whatever the motor sent since the last tick before deciding
+  // anything: late auxiliary replies land in the cache here rather than being
+  // discarded by the feedback wait further down.
+  g_can.pump();
+
+  // The instantaneous word is rebuilt from nothing every tick. Anything that
+  // belongs in it must be re-asserted below or it disappears, which is the
+  // point - "regen is capping me" is only true while it is true.
+  g_active = 0;
 
   Params P;
   portENTER_CRITICAL(&g_mux); P = g_par; portEXIT_CRITICAL(&g_mux);
@@ -482,7 +614,10 @@ void tick() {
   }
 
   const bool braking = (cmd.t_ff * g_tm.vel < 0.0f) && (fabsf(g_tm.vel) > 1.0f);
-  if (!slot_used) auxPoll(braking);
+  // Runs on every tick now, including the ones a UI request consumed: sending
+  // a request costs one frame and no wait, and harvesting replies must not
+  // stall just because the operator touched the screen.
+  auxPoll(P, braking);
 
   evaluateFaults(P, now_ms, cmd.t_ff);
 
@@ -495,17 +630,21 @@ void tick() {
   g_tm.i_cmd      = (P.kt > 1e-3f) ? (cmd.t_ff / P.kt) : 0.0f;
   g_tm.iq         = g_iq;
   g_tm.vbus       = g_vbus;
+  g_tm.aux_age_ms = g_vbus_age;
+  g_tm.aux_ok     = g_vbus_ok;
   g_tm.vbus_trip  = g_vbus_trip;
   g_tm.state      = g_state;
   g_tm.mode       = g_mode;
   g_tm.enabled    = g_enabled;
   g_tm.events     = g_events;
+  g_tm.active     = g_active;
   g_tm.fault_word = g_fault_word;
   g_tm.warn_word  = g_warn_word;
   g_tm.reach_ms   = g_traj.reachMs();
   g_tm.peak_vel   = g_traj.peakVel();
   g_tm.rtt_us     = g_can.lastRttUs();
   g_tm.tx         = g_can.txCount();
+  g_tm.mtx        = g_can.motionTxCount();
   g_tm.rx         = g_can.rxCount();
   g_tm.miss       = g_can.missCount();
   g_can.busStats(g_tm.twai_state, g_tm.twai_tec, g_tm.twai_rec,
@@ -523,7 +662,7 @@ void tick() {
   s.v_cmd  = cmd.v_set;   s.v_act = g_tm.vel;
   s.t_cmd  = cmd.t_ff;    s.t_act = g_tm.torque;
   s.iq     = g_iq;        s.vbus  = g_vbus;  s.temp = g_tm.temp;
-  s.events = g_events;    s.state = g_state; s._pad = 0;
+  s.events = g_events;    s.active = g_active; s.state = g_state;
   logger::push(s);
 }
 
@@ -537,6 +676,13 @@ void ctrlTask(void*) {
 
 } // namespace
 
+#ifdef CTRL_HOST_TEST
+// Test-only hook. The host build does not spawn the control task, so the
+// tests advance the loop one slot at a time through here. Never compiled into
+// firmware - see test/host/.
+extern "C" void ctrl_host_tick() { tick(); }
+#endif
+
 // ===========================================================================
 namespace ctrl {
 
@@ -548,6 +694,16 @@ bool begin(CommandSource* src) {
   if (!g_q) return false;
 
   if (!g_can.begin(g_par.motor_id, g_par.can_tx, g_par.can_rx, g_par.can_baud)) return false;
+
+  // Start from a defined state rather than whatever the globals happen to
+  // hold. Nothing should be carried in here, and the supply reference in
+  // particular must be measured, never assumed.
+  g_events = 0; g_active = 0; g_miss_run = 0; g_aux = 0;
+  g_enabled = false; g_first_fb = true; g_turns = 0;
+  g_pos = 0.0f; g_pos_unwrap = 0.0f; g_prev_raw = 0.0f;
+  g_fault_word = 0; g_warn_word = 0;
+  g_tm = Telemetry{}; g_pub = Telemetry{};
+  resetVbusRef();
 
   Feedback fb;
   g_can.stop(false, fb);          // known state: disabled

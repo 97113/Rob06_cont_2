@@ -17,9 +17,10 @@ struct LogSample {
   float    v_cmd, v_act;
   float    t_cmd, t_act;
   float    iq, vbus, temp;
-  uint16_t events;
+  uint32_t events;    // latched  - what went wrong
+  uint32_t active;    // this tick - what was limiting
   uint8_t  state;
-  uint8_t  _pad;
+  uint8_t  _pad[3];
 };
 
 namespace logger {

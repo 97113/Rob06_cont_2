@@ -194,7 +194,10 @@ void Calibration::tick(float dt, const Telemetry& tm, Params& p, rs06::MotionCmd
       gi_++;
       if (gi_ >= N_KP * N_KD) {
         p.kp = best_kp_; p.kd = best_kd_;
-        comm_tx0_ = tm.tx; comm_miss0_ = tm.miss; rtt_sum_ = 0; rtt_n_ = 0;
+        // Count Type1 frames only. tx includes the fire-and-forget auxiliary
+        // requests, which have no reply to miss, so using it as the
+        // denominator would quietly understate the real drop rate.
+        comm_tx0_ = tm.mtx; comm_miss0_ = tm.miss; rtt_sum_ = 0; rtt_n_ = 0;
         traj_.moveTo(p0_, tm.pos, tm.vel);
         enter(CS_COMM, "link quality");
       } else {
@@ -221,7 +224,7 @@ void Calibration::tick(float dt, const Telemetry& tm, Params& p, rs06::MotionCmd
     if (tm.rtt_us > 0) { rtt_sum_ += tm.rtt_us; rtt_n_++; }
 
     if (t_ms_ >= 1000) {
-      const uint32_t dtx   = tm.tx   - comm_tx0_;
+      const uint32_t dtx   = tm.mtx  - comm_tx0_;
       const uint32_t dmiss = tm.miss - comm_miss0_;
       p.meas_rtt_us   = (rtt_n_ > 0) ? (float)(rtt_sum_ / rtt_n_) : 0.0f;
       p.meas_drop_pct = (dtx > 0) ? (100.0f * dmiss / dtx) : 0.0f;

@@ -46,18 +46,18 @@ size_t capacity() { return cap_; }
 bool   sdReady()  { return sd_ok_; }
 
 const char* csvHeader() {
-  return "t_us,p_cmd_deg,p_act_deg,v_cmd,v_act,t_cmd,t_act,iq,vbus,temp,state,events";
+  return "t_us,p_cmd_deg,p_act_deg,v_cmd,v_act,t_cmd,t_act,iq,vbus,temp,state,events,active";
 }
 
 // Shared row formatter so the SD file and the serial dump can never drift.
 static int formatRow(const LogSample& s, char* line, size_t n) {
   return snprintf(line, n,
-    "%lu,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%.3f,%.2f,%.1f,%u,%u\n",
+    "%lu,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%.3f,%.2f,%.1f,%u,%lu,%lu\n",
     (unsigned long)s.t_us,
     s.p_cmd * 57.29578f, s.p_act * 57.29578f,
     s.v_cmd, s.v_act, s.t_cmd, s.t_act,
     s.iq, s.vbus, s.temp,
-    (unsigned)s.state, (unsigned)s.events);
+    (unsigned)s.state, (unsigned long)s.events, (unsigned long)s.active);
 }
 
 int dumpToStream(Print& out, size_t max_samples) {
@@ -98,14 +98,7 @@ int dumpToSd(char* path_out, size_t path_len) {
   const size_t start = (head_ + cap_ - n) % cap_;
   char line[192];
   for (size_t i = 0; i < n; i++) {
-    const LogSample& s = buf_[(start + i) % cap_];
-    int len = snprintf(line, sizeof(line),
-      "%lu,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%.3f,%.2f,%.1f,%u,%u\n",
-      (unsigned long)s.t_us,
-      s.p_cmd * 57.29578f, s.p_act * 57.29578f,
-      s.v_cmd, s.v_act, s.t_cmd, s.t_act,
-      s.iq, s.vbus, s.temp,
-      (unsigned)s.state, (unsigned)s.events);
+    const int len = formatRow(buf_[(start + i) % cap_], line, sizeof(line));
     f.write((const uint8_t*)line, len);
   }
   f.close();

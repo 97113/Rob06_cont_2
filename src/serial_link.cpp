@@ -22,8 +22,11 @@ uint8_t   g_len       = 0;
 uint32_t  g_stream_hz = 0;
 uint32_t  g_next_us   = 0;
 
+// events = latched (what went wrong), active = this instant (what is
+// limiting). fault is the raw Type21 word, so a cause with no event bit of
+// its own can still be identified from the PC side.
 const char* TELEM_HEADER =
-  "#H t_ms,state,events,enabled,p_cmd_deg,p_act_deg,v_cmd,v_act,"
+  "#H t_ms,state,events,active,fault,enabled,p_cmd_deg,p_act_deg,v_cmd,v_act,"
   "t_cmd,t_act,iq,vbus,temp,reach_ms,peak_vel,tx,rx,miss";
 
 void req(uint8_t t, float f = 0.0f, uint8_t u = 0) {
@@ -58,10 +61,12 @@ void sendParams() {
 
 void sendTelemetry() {
   Telemetry t; ctrl::snapshot(t);
-  char line[224];
+  char line[256];
   snprintf(line, sizeof(line),
-    "T,%lu,%s,%u,%d,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%.3f,%.2f,%.1f,%lu,%.3f,%lu,%lu,%lu",
-    (unsigned long)millis(), ctrl::stateName(t.state), (unsigned)t.events,
+    "T,%lu,%s,%lu,%lu,%lu,%d,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%.3f,%.2f,%.1f,%lu,%.3f,%lu,%lu,%lu",
+    (unsigned long)millis(), ctrl::stateName(t.state),
+    (unsigned long)t.events, (unsigned long)t.active,
+    (unsigned long)t.fault_word,
     t.enabled ? 1 : 0,
     t.p_cmd * RAD2DEG, t.pos * RAD2DEG,
     t.v_cmd, t.vel, t.t_cmd, t.torque,

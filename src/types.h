@@ -73,20 +73,40 @@ enum CtrlState : uint8_t {
 };
 
 // --- event / fault bookkeeping --------------------------------------------
-enum EventBits : uint16_t {
-  EV_CAN_MISS      = 1 << 0,
-  EV_CAN_BUS_OFF   = 1 << 1,
-  EV_TEMP_DERATE   = 1 << 2,
-  EV_TEMP_TRIP     = 1 << 3,
-  EV_OVERVOLT      = 1 << 4,
-  EV_UNDERVOLT     = 1 << 5,
-  EV_OVERCURRENT   = 1 << 6,
-  EV_ENCODER       = 1 << 7,
-  EV_STALL         = 1 << 8,
-  EV_CMDSRC_STALE  = 1 << 9,
-  EV_POS_LIMIT     = 1 << 10,
-  EV_REGEN_LIMIT   = 1 << 11,
-  EV_UNCALIBRATED  = 1 << 12,
+//
+// Two words carry these, and which word a bit lands in is the whole point:
+//
+//   Telemetry::events  LATCHED. Something went wrong; it stays set until the
+//                      operator clears the fault or restarts. Reading it
+//                      answers "what happened?".
+//   Telemetry::active  INSTANTANEOUS. Recomputed from scratch every tick.
+//                      Reading it answers "what is limiting me right now?".
+//
+// Mixing the two is what made the old single word useless: EV_REGEN_LIMIT
+// fires for one millisecond on every fast move (600 W / 31.5 rad/s = 19 Nm,
+// just under the 20 Nm torque limit), and because nothing ever cleared it,
+// ten of the twelve captures in tools/ show REGEN-LIM lit permanently - with
+// any real fault hidden behind it.
+enum EventBits : uint32_t {
+  EV_CAN_MISS      = 1u << 0,
+  EV_CAN_BUS_OFF   = 1u << 1,
+  EV_TEMP_DERATE   = 1u << 2,
+  EV_TEMP_TRIP     = 1u << 3,
+  EV_OVERVOLT      = 1u << 4,
+  EV_UNDERVOLT     = 1u << 5,
+  EV_OVERCURRENT   = 1u << 6,
+  EV_ENCODER       = 1u << 7,
+  EV_STALL         = 1u << 8,
+  EV_CMDSRC_STALE  = 1u << 9,
+  EV_POS_LIMIT     = 1u << 10,
+  EV_REGEN_LIMIT   = 1u << 11,
+  EV_UNCALIBRATED  = 1u << 12,
+  // Distinct causes that used to be flattened into EV_OVERCURRENT, so the
+  // screen said "OVERCURRENT" when the gate driver had failed.
+  EV_DRIVER_CHIP   = 1u << 13,   // Type21 bit1
+  EV_POS_INIT      = 1u << 14,   // Type21 bit9,  position initialisation
+  EV_HW_ID         = 1u << 15,   // Type21 bit8,  hardware id
+  EV_AUX_STALE     = 1u << 16,   // VBUS / current readings have gone quiet
 };
 
 enum CtrlMode : uint8_t { CM_POSITION = 0, CM_TORQUE = 1 };
@@ -101,6 +121,8 @@ struct Telemetry {
   float temp      = 0;   // degC
   float iq        = 0;   // A   (Type17 0x701A)
   float vbus      = 0;   // V   (Type17 0x701C)
+  uint32_t aux_age_ms = 0;      // age of the VBUS reading, ms
+  bool     aux_ok     = false;  // VBUS fresh enough for the safety layer
 
   // commanded
   float p_cmd     = 0;
@@ -117,7 +139,8 @@ struct Telemetry {
   uint8_t  mode_state  = 0;
   uint32_t fault_word  = 0;
   uint32_t warn_word   = 0;
-  uint16_t events      = 0;
+  uint32_t events      = 0;   // latched  - what went wrong
+  uint32_t active      = 0;   // this tick - what is limiting right now
   bool     enabled     = false;
 
   // motion bookkeeping
@@ -126,7 +149,8 @@ struct Telemetry {
 
   // link quality
   uint32_t rtt_us      = 0;
-  uint32_t tx          = 0;
+  uint32_t tx          = 0;   // every frame sent, including aux requests
+  uint32_t mtx         = 0;   // Type1 frames only - the drop-rate denominator
   uint32_t rx          = 0;
   uint32_t miss        = 0;
   float    vbus_trip   = 0;

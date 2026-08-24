@@ -3,6 +3,8 @@
 
 using namespace rs06;
 
+uint32_t Rs06::nowMs() { return (uint32_t)(esp_timer_get_time() / 1000); }
+
 bool Rs06::begin(uint8_t motor_id, uint8_t tx_gpio, uint8_t rx_gpio, uint32_t baud) {
   motor_id_ = motor_id;
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(
@@ -19,6 +21,7 @@ bool Rs06::begin(uint8_t motor_id, uint8_t tx_gpio, uint8_t rx_gpio, uint32_t ba
   if (twai_driver_install(&g, &t, &f) != ESP_OK) return false;
   if (twai_start() != ESP_OK) { twai_driver_uninstall(); return false; }
   started_ = true;
+  resetCache();
   return true;
 }
 
@@ -27,6 +30,79 @@ void Rs06::end() {
   twai_stop();
   twai_driver_uninstall();
   started_ = false;
+}
+
+void Rs06::resetCache() {
+  for (int i = 0; i < N_PCACHE; i++) pc_[i] = PSlot{};
+  fault_ = warn_ = 0;
+  fault_seen_ = false;
+  fb_valid_   = false;
+}
+
+// ---------------------------------------------------------------------------
+// Slot lookup. The table is tiny (two indices in normal operation), so a
+// linear scan beats anything cleverer. A full table recycles the least
+// recently updated entry rather than failing.
+// ---------------------------------------------------------------------------
+Rs06::PSlot* Rs06::pslot(uint16_t idx) {
+  for (int i = 0; i < N_PCACHE; i++)
+    if (pc_[i].used && pc_[i].idx == idx) return &pc_[i];
+  for (int i = 0; i < N_PCACHE; i++)
+    if (!pc_[i].used) { pc_[i].used = true; pc_[i].idx = idx; return &pc_[i]; }
+  int oldest = 0;
+  for (int i = 1; i < N_PCACHE; i++)
+    if ((int32_t)(pc_[i].t_ms - pc_[oldest].t_ms) < 0) oldest = i;
+  pc_[oldest] = PSlot{};
+  pc_[oldest].used = true;
+  pc_[oldest].idx  = idx;
+  return &pc_[oldest];
+}
+
+const Rs06::PSlot* Rs06::pslotConst(uint16_t idx) const {
+  for (int i = 0; i < N_PCACHE; i++)
+    if (pc_[i].used && pc_[i].seen && pc_[i].idx == idx) return &pc_[i];
+  return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// The one place frames are taken off the queue. Every reply the motor sends
+// is filed here, whatever the caller happens to be waiting for.
+// ---------------------------------------------------------------------------
+void Rs06::pump() {
+  twai_message_t m;
+  // Bounded so a flooded bus cannot stall the control tick inside this loop.
+  for (int guard = 0; guard < 48; guard++) {
+    if (twai_receive(&m, 0) != ESP_OK) return;
+    rx_++;
+    const uint8_t ty = id_type(m.identifier);
+
+    switch (ty) {
+    case CT_FEEDBACK:
+      if (parse_feedback(m.identifier, m.data, last_fb_)) fb_valid_ = true;
+      break;
+
+    case CT_PARAM_READ: {
+      const uint16_t idx = (uint16_t)m.data[0] | ((uint16_t)m.data[1] << 8);
+      PSlot* s = pslot(idx);
+      s->raw  = le_get32(&m.data[4]);
+      s->t_ms = nowMs();
+      s->seq++;
+      s->seen = true;
+      break;
+    }
+
+    case CT_FAULT_FB:
+      fault_      = le_get32(&m.data[0]);
+      warn_       = le_get32(&m.data[4]);
+      fault_t_ms_ = nowMs();
+      fault_seen_ = true;
+      break;
+
+    default:
+      break;
+    }
+    type_seq_[ty & 31]++;
+  }
 }
 
 bool Rs06::xmit(uint32_t id, const uint8_t d[8]) {
@@ -40,31 +116,29 @@ bool Rs06::xmit(uint32_t id, const uint8_t d[8]) {
   return true;
 }
 
-bool Rs06::waitFor(uint8_t type, uint32_t timeout_us, twai_message_t& out) {
+bool Rs06::waitType(uint8_t type, uint32_t timeout_us) {
+  const uint8_t  k  = type & 31;
+  const uint16_t s0 = type_seq_[k];
   const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_us;
-  twai_message_t m;
   do {
-    if (twai_receive(&m, 0) == ESP_OK) {
-      rx_++;
-      const uint8_t ty = id_type(m.identifier);
-      if (ty == CT_FEEDBACK) {
-        // Latch telemetry regardless of what we were waiting for.
-        if (parse_feedback(m.identifier, m.data, last_fb_)) fb_valid_ = true;
-      }
-      if (ty == type) { out = m; return true; }
-    }
+    pump();
+    if (type_seq_[k] != s0) return true;
   } while (esp_timer_get_time() < deadline);
   miss_++;
   return false;
 }
 
+// ---------------------------------------------------------------------------
 bool Rs06::sendMotion(const MotionCmd& c, Feedback& fb) {
   uint32_t id; uint8_t d[8];
   build_motion(c, motor_id_, id, d);
+  // Clear anything already queued first, so the wait below cannot be satisfied
+  // by the previous tick's feedback and report a stale position as fresh.
+  pump();
   const int64_t t0 = esp_timer_get_time();
   if (!xmit(id, d)) { miss_++; return false; }
-  twai_message_t m;
-  if (!waitFor(CT_FEEDBACK, RESP_TIMEOUT_US, m)) return false;
+  mtx_++;
+  if (!waitType(CT_FEEDBACK, RESP_TIMEOUT_US)) return false;
   rtt_us_ = (uint32_t)(esp_timer_get_time() - t0);
   fb = last_fb_;
   return true;
@@ -81,9 +155,9 @@ static inline void simple_frame(uint8_t type, uint8_t motor_id, uint8_t b0,
 bool Rs06::enable(Feedback& fb) {
   uint32_t id; uint8_t d[8];
   simple_frame(CT_ENABLE, motor_id_, 0, id, d);
+  pump();
   if (!xmit(id, d)) return false;
-  twai_message_t m;
-  if (!waitFor(CT_FEEDBACK, RESP_TIMEOUT_US, m)) return false;
+  if (!waitType(CT_FEEDBACK, RESP_TIMEOUT_US)) return false;
   fb = last_fb_;
   return true;
 }
@@ -91,9 +165,9 @@ bool Rs06::enable(Feedback& fb) {
 bool Rs06::stop(bool clear_fault, Feedback& fb) {
   uint32_t id; uint8_t d[8];
   simple_frame(CT_STOP, motor_id_, clear_fault ? 1 : 0, id, d);
+  pump();
   if (!xmit(id, d)) return false;
-  twai_message_t m;
-  if (!waitFor(CT_FEEDBACK, RESP_TIMEOUT_US, m)) return false;
+  if (!waitType(CT_FEEDBACK, RESP_TIMEOUT_US)) return false;
   fb = last_fb_;
   return true;
 }
@@ -101,9 +175,9 @@ bool Rs06::stop(bool clear_fault, Feedback& fb) {
 bool Rs06::setZero(Feedback& fb) {
   uint32_t id; uint8_t d[8];
   simple_frame(CT_SET_ZERO, motor_id_, 1, id, d);
+  pump();
   if (!xmit(id, d)) return false;
-  twai_message_t m;
-  if (!waitFor(CT_FEEDBACK, RESP_TIMEOUT_US, m)) return false;
+  if (!waitType(CT_FEEDBACK, RESP_TIMEOUT_US)) return false;
   fb = last_fb_;
   return true;
 }
@@ -111,9 +185,9 @@ bool Rs06::setZero(Feedback& fb) {
 bool Rs06::save() {
   uint32_t id = make_id(CT_SAVE, (uint16_t)HOST_ID, motor_id_);
   uint8_t d[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  pump();
   if (!xmit(id, d)) return false;
-  twai_message_t m;
-  return waitFor(CT_FEEDBACK, RESP_TIMEOUT_US, m);
+  return waitType(CT_FEEDBACK, RESP_TIMEOUT_US);
 }
 
 // ID layout for Type7: data area 2 holds the host id in its low byte and the
@@ -124,30 +198,61 @@ bool Rs06::setCanId(uint8_t new_id) {
                         (uint16_t)(((uint16_t)new_id << 8) | (uint16_t)HOST_ID),
                         motor_id_);
   uint8_t d[8]{};
+  pump();
   if (!xmit(id, d)) return false;
-  twai_message_t m;
-  if (!waitFor(CT_GET_ID, RESP_TIMEOUT_US, m)) return false;
+  if (!waitType(CT_GET_ID, RESP_TIMEOUT_US)) return false;
   motor_id_ = new_id;
   return true;
 }
 
-bool Rs06::readParamRaw(uint16_t idx, uint32_t& raw) {
+// ---------------------------------------------------------------------------
+// Asynchronous parameter access
+// ---------------------------------------------------------------------------
+bool Rs06::requestParam(uint16_t idx) {
   uint32_t id = make_id(CT_PARAM_READ, (uint16_t)HOST_ID, motor_id_);
   uint8_t d[8]{};
   le_put16(&d[0], idx);            // index: little endian
-  if (!xmit(id, d)) return false;
-  twai_message_t m;
-  if (!waitFor(CT_PARAM_READ, AUX_RESP_TIMEOUT_US, m)) return false;
-  if (((uint16_t)m.data[0] | ((uint16_t)m.data[1] << 8)) != idx) return false;
-  raw = le_get32(&m.data[4]);      // payload: little endian
+  return xmit(id, d);
+}
+
+bool Rs06::requestFault() {
+  uint32_t id = make_id(CT_FAULT_FB, (uint16_t)HOST_ID, motor_id_);
+  uint8_t d[8]{};
+  return xmit(id, d);
+}
+
+bool Rs06::paramValue(uint16_t idx, float& v, uint32_t& age_ms) const {
+  const PSlot* s = pslotConst(idx);
+  if (!s) return false;
+  memcpy(&v, &s->raw, 4);          // payload: little endian, already unpacked
+  age_ms = nowMs() - s->t_ms;
   return true;
 }
 
-bool Rs06::readParamF(uint16_t idx, float& v) {
-  uint32_t raw;
-  if (!readParamRaw(idx, raw)) return false;
-  memcpy(&v, &raw, 4);
+bool Rs06::faultWords(uint32_t& fault, uint32_t& warn, uint32_t& age_ms) const {
+  if (!fault_seen_) return false;
+  fault  = fault_;
+  warn   = warn_;
+  age_ms = nowMs() - fault_t_ms_;
   return true;
+}
+
+bool Rs06::readParamF(uint16_t idx, float& v, uint32_t timeout_us) {
+  PSlot* s = pslot(idx);
+  const uint16_t seq0 = s->seq;
+  pump();
+  if (!requestParam(idx)) return false;
+  const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_us;
+  do {
+    pump();
+    // Only this index counts, and only a reply that arrived AFTER the request.
+    // The old code accepted the first Type17 frame it saw and then failed the
+    // index check, which is why a reply meant for a different index silently
+    // killed the read.
+    if (s->seq != seq0) { memcpy(&v, &s->raw, 4); return true; }
+  } while (esp_timer_get_time() < deadline);
+  miss_++;
+  return false;
 }
 
 bool Rs06::paramWrite(uint16_t idx, const uint8_t data4[4], bool wait_reply) {
@@ -155,10 +260,10 @@ bool Rs06::paramWrite(uint16_t idx, const uint8_t data4[4], bool wait_reply) {
   uint8_t d[8]{};
   le_put16(&d[0], idx);
   memcpy(&d[4], data4, 4);
+  if (wait_reply) pump();
   if (!xmit(id, d)) return false;
   if (!wait_reply) return true;
-  twai_message_t m;
-  return waitFor(CT_FEEDBACK, AUX_RESP_TIMEOUT_US, m);
+  return waitType(CT_FEEDBACK, SYNC_RESP_TIMEOUT_US);
 }
 
 bool Rs06::writeParamF(uint16_t idx, float v, bool wait_reply) {
@@ -178,23 +283,12 @@ bool Rs06::writeParamU32(uint16_t idx, uint32_t v, bool wait_reply) {
   return paramWrite(idx, b, wait_reply);
 }
 
-bool Rs06::readFault(uint32_t& fault, uint32_t& warn) {
-  uint32_t id = make_id(CT_FAULT_FB, (uint16_t)HOST_ID, motor_id_);
-  uint8_t d[8]{};
-  if (!xmit(id, d)) return false;
-  twai_message_t m;
-  if (!waitFor(CT_FAULT_FB, AUX_RESP_TIMEOUT_US, m)) return false;
-  fault = le_get32(&m.data[0]);
-  warn  = le_get32(&m.data[4]);
-  return true;
-}
-
 bool Rs06::setActiveReport(bool on) {
   uint32_t id = make_id(CT_ACTIVE_REP, (uint16_t)HOST_ID, motor_id_);
   uint8_t d[8] = {1, 2, 3, 4, 5, 6, (uint8_t)(on ? 1 : 0), 0};
+  pump();
   if (!xmit(id, d)) return false;
-  twai_message_t m;
-  return waitFor(CT_ACTIVE_REP, AUX_RESP_TIMEOUT_US, m);
+  return waitType(CT_ACTIVE_REP, SYNC_RESP_TIMEOUT_US);
 }
 
 void Rs06::busStats(uint8_t& state, uint16_t& tec, uint16_t& rec,

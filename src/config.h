@@ -46,15 +46,25 @@ static constexpr uint32_t CTRL_PERIOD_US  = 1000;   // 1 kHz
 static constexpr int      CTRL_PRIO       = 20;
 static constexpr int      UI_PRIO         = 2;
 
-// Response wait budget inside one control slot (busy-poll, microseconds).
+// Response wait budget for the Type1 exchange, which must complete inside the
+// slot because the control law needs this millisecond's position.
 static constexpr uint32_t RESP_TIMEOUT_US      = 600;
-static constexpr uint32_t AUX_RESP_TIMEOUT_US  = 300;
+// Budget for the blocking helpers used during setup (parameter writes, the
+// synchronous readParamF). Never runs inside a moving control loop.
+static constexpr uint32_t SYNC_RESP_TIMEOUT_US = 600;
 
-// Aux polling rates (Type17 / Type21 slots interleaved between Type1 frames)
+// Aux request rates. These now schedule a fire-and-forget REQUEST; the reply
+// is filed by Rs06::pump() whenever it arrives, so a slow answer no longer
+// costs the slot - or gets thrown away, which is what used to happen.
 static constexpr uint32_t AUX_IQF_DIV        = 20;  // 1kHz/20  =  50 Hz
 static constexpr uint32_t AUX_VBUS_DIV       = 5;   // 1kHz/5   = 200 Hz
 static constexpr uint32_t AUX_VBUS_DIV_DECEL = 2;   // 1kHz/2   = 500 Hz (braking)
 static constexpr uint32_t AUX_FAULT_DIV      = 20;  // 1kHz/20  =  50 Hz
+
+// How old a cached auxiliary reading may be before the safety layer stops
+// trusting it. Generous next to the 5 ms request interval, tight enough that
+// a dead link is noticed within one control decision.
+static constexpr uint32_t AUX_STALE_MS       = 100;
 
 // --- Motor / mechanics defaults -------------------------------------------
 // Kt referred to the OUTPUT shaft (9:1 already included).
@@ -91,12 +101,22 @@ static constexpr float    DEF_TEMP_DERATE_C = 100.0f;  // start linear derate
 static constexpr float    DEF_TEMP_TRIP_C   = 130.0f;  // hard stop
 static constexpr float    DEF_VBUS_MARGIN_V = 4.0f;    // trip = boot VBUS + margin
 static constexpr float    DEF_VBUS_TRIP_MAX = 58.0f;   // never above this
-// Host-side undervoltage guard. Set low enough to bring the machine up on a
-// bench supply (the RS06 itself is rated from 15 V). RAISE THIS TO ~38 V once
-// running from the 13S pack, so an over-discharge is caught. The motor's own
-// undervoltage fault (Type2 bit16 / Type21 bit2) guards independently either
-// way, and the BMS is the real protection for the pack.
+// Number of good readings averaged (median) into the rest-voltage reference
+// the overvoltage trip is built on. One sample taken at an arbitrary moment
+// is not a baseline: if it happens to land just after a braking pulse has
+// already lifted the rail, every later threshold is skewed with it.
+static constexpr int      VBUS_REF_SAMPLES  = 9;
+// Absolute floor, deliberately low so the machine still comes up on a bench
+// supply (the RS06 itself is rated from 15 V). This alone is NOT the pack
+// guard - see VBUS_SAG_TRIP_FRAC, which scales with whatever supply is
+// actually fitted. Raise this to ~38 V if you want a fixed 13S floor as well.
 static constexpr float    DEF_VBUS_MIN_V    = 14.0f;
+// Supply-relative undervoltage guard: trip if the rail collapses to this
+// fraction of its measured rest voltage. Works on a 32 V bench supply and on
+// a 13S pack without reconfiguration (0.70 x 54.6 V = 38 V, the pack floor;
+// 0.70 x 32 V = 22 V on the bench). The worst sag measured on a full-effort
+// 200 deg move is about 11 %, so this has ample margin.
+static constexpr float    VBUS_SAG_TRIP_FRAC = 0.70f;
 static constexpr float    DEF_REGEN_W_MAX   = 600.0f;  // W, |tau*omega| while braking
 static constexpr uint32_t DEF_CAN_MISS_SOFT = 5;       // consecutive misses -> soft
 static constexpr uint32_t DEF_CAN_MISS_HARD = 50;      // consecutive misses -> hard
