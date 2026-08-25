@@ -123,32 +123,47 @@ ID が分からなくなった場合は BtnA 起動のスキャナが 0x00〜0x7
 
 ## 2. 書き込み
 
-### 方法A: Arduino IDE（この環境ではこちらが最短）
+### 依存ライブラリ
 
-必要なもの（すべてインストール済みであることを確認済み）：
-ESP32 core 3.3.7 / M5Unified 0.2.15 / M5GFX 0.2.21
+**外部ライブラリは `M5Unified` の 1 つだけ**です。`SD.h` / `SPI.h` / `Preferences.h` /
+`driver/twai.h` / `esp_timer.h` / `esp_heap_caps.h` / `freertos/*` はすべて
+ESP32 ボードパッケージに同梱されているので、個別のインストールは要りません。
 
-1. `Rob06_cont_2.ino` をダブルクリックして Arduino IDE で開く
+| | ESP32 core | M5Unified | M5GFX |
+|---|---|---|---|
+| 開発時の検証バージョン | 3.3.7 | 0.2.15 | 0.2.21 |
+
+**PlatformIO は自動で取得します**（`platformio.ini` に宣言済み）。手当が要るのは Arduino IDE だけです。
+
+> `fatal error: M5Unified.h: No such file or directory` はこのライブラリ未導入が原因です。
+> 下の手順1でインストールしてください。
+
+### 方法A: Arduino IDE
+
+1. **ツール → ライブラリを管理…**（`Ctrl+Shift+I`）で **`M5Unified`** を検索し、
+   M5Stack 製のものをインストール。依存ライブラリを聞かれたら **Install all**
+   （描画層の `M5GFX` が一緒に入ります。必須です）
+2. `Rob06_cont_2.ino` をダブルクリックして Arduino IDE で開く
    （`.ino` は空ファイル。Arduino はスケッチ直下の `src/` を再帰的にコンパイルするため、
-   実体は `src/main.cpp` の `setup()` / `loop()` です）
-2. Core2 を USB-C で接続
-3. **ツール → ボード → M5Stack → M5Core2**
-4. **ツール → PSRAM → Enabled**（30秒ログリングが PSRAM 上にあるため必須）
-5. **ツール → Upload Speed → 921600**（失敗するなら 115200 に落とす）
-6. **ツール → シリアルポート** で Core2 の COM を選択
-7. → ボタン（Upload）
+   実体は `src/main.cpp` の `setup()` / `loop()` です。
+   スケッチフォルダ名と `.ino` の名前は一致している必要があります）
+3. Core2 を USB-C で接続
+4. **ツール → ボード → M5Stack → M5Core2**
+5. **ツール → PSRAM → Enabled**（30秒ログリングが PSRAM 上にあるため必須。
+   無効だと 2000 サンプルの縮退リングに落ちます）
+6. **ツール → Upload Speed → 921600**（失敗するなら 115200 に落とす）
+7. **ツール → シリアルポート** で Core2 の COM を選択
+8. → ボタン（Upload）
 
 ### 方法B: PlatformIO
 
 ```bash
 pip install platformio
-```
-
-```bash
 pio run -t upload
 ```
 
 espressif32@^6.9.0 / arduino framework。`.ino` は無視されます。
+M5Unified は `lib_deps` から自動で取得されるので、ライブラリの手動導入は不要です。
 
 ### USBドライバ
 
