@@ -732,7 +732,12 @@ void getParams(Params& out) {
 void setParams(const Params& p) {
   portENTER_CRITICAL(&g_mux); g_par = p; portEXIT_CRITICAL(&g_mux);
   store::save(p);
-  CtrlRequest r{ REQ_PARAMS_CHANGED, 0, 0.0f };
+  // Field assignment, not brace init: CtrlRequest carries default member
+  // initialisers, so it is only an aggregate from C++14 on. The Arduino core
+  // still hands the compiler -std=gnu++11 in some setups, and there the braces
+  // look for a constructor that does not exist.
+  CtrlRequest r;
+  r.type = REQ_PARAMS_CHANGED;
   request(r);
 }
 
